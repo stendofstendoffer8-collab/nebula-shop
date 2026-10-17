@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+import aiohttp_cors
 from pathlib import Path
 
 from aiohttp import web
@@ -672,6 +673,17 @@ def make_app():
     app = web.Application()
     app.router.add_post("/order", handle_order)
     app.router.add_get("/health", handle_health)
+
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=False,
+            expose_headers="*",
+            allow_headers=("Content-Type", "X-Secret"),
+            allow_methods=("POST", "OPTIONS"),
+        )
+    })
+    for route in list(app.router.routes()):
+        cors.add(route)
     return app
 
 # ---------- Запуск ----------
