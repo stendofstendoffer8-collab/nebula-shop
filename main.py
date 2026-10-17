@@ -283,6 +283,19 @@ async def handle_options(request: web.Request):
     # preflight-запрос от браузера — отвечаем 200 и разрешаем
     return web.Response(status=200, headers=cors_headers())
 
+# ---------- CORS ----------
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Secret",
+        "Access-Control-Max-Age": "86400",
+    }
+
+async def handle_options(request: web.Request):
+    # preflight-запрос от браузера — отвечаем 200 и разрешаем
+    return web.Response(status=200, headers=cors_headers())
+
 def make_app():
     app = web.Application()
     app.router.add_post("/order", handle_order)
