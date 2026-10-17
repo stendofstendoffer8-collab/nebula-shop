@@ -21,11 +21,17 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080") or 8080)
 
-DB_PATH = Path(__file__).parent / "orders.db"
+DB_PATH = os.getenv("DB_PATH", "/data/orders.db").strip() or "/data/orders.db"
 
 # ---------- БД ----------
+def db_connect():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    return sqlite3.connect(DB_PATH)
+
 def db_init():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             num TEXT PRIMARY KEY,
@@ -40,7 +46,7 @@ def db_init():
     con.close()
 
 def db_save(order: dict):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute(
         "INSERT OR REPLACE INTO orders (num, created_at, user_id, city, total, payload) VALUES (?,?,?,?,?,?)",
         (
@@ -56,7 +62,7 @@ def db_save(order: dict):
     con.close()
 
 def db_get(num: str):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     row = con.execute(
         "SELECT num, created_at, user_id, city, total, payload FROM orders WHERE num=?",
         (num,),
@@ -74,7 +80,7 @@ def db_get(num: str):
     }
 
 def db_last(limit=5):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     rows = con.execute(
         "SELECT num FROM orders ORDER BY created_at DESC LIMIT ?",
         (limit,),
@@ -237,7 +243,22 @@ async def msg_fallback(msg: types.Message):
 def check_secret(request: web.Request) -> bool:
     return request.headers.get("X-Secret", "") == WEBHOOK_SECRET
 
+CORS_ORIGIN = (SITE_URL or "https://nebula-kungur.netlify.app").rstrip("/")
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": CORS_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Secret",
+}
+
+async def handle_order_options(request: web.Request):
+    return web.Response(status=204, headers=CORS_HEADERS)
+
 async def handle_order(request: web.Request):
+    resp = await _handle_order(request)
+    resp.headers.update(CORS_HEADERS)
+    return resp
+
+async def _handle_order(request: web.Request):
     if not check_secret(request):
         return web.json_response({"ok": False, "err": "bad secret"}, status=403)
     try:
@@ -258,6 +279,7 @@ async def handle_order(request: web.Request):
         "items": data.get("items", []),
     }
     db_save(order)
+    print(f"New order #{num}", flush=True)
 
     if ADMIN_ID:
         try:
@@ -272,6 +294,7 @@ async def handle_health(request: web.Request):
 
 def make_app():
     app = web.Application()
+    app.router.add_route("OPTIONS", "/order", handle_order_options)
     app.router.add_post("/order", handle_order)
     app.router.add_get("/health", handle_health)
     return app
