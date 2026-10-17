@@ -3,7 +3,6 @@ import json
 import os
 import sqlite3
 import time
-import aiohttp_cors
 from pathlib import Path
 
 from aiohttp import web
@@ -20,14 +19,17 @@ ADMIN_IDS = [int(x) for x in (os.getenv("ADMIN_IDS", "") or "").replace(" ", "")
 if not ADMIN_IDS and ADMIN_ID:
     ADMIN_IDS = [ADMIN_ID]
 
+# Главный админ — тот, кто может назначать/снимать операторов.
+# По умолчанию — первый из ADMIN_IDS (или ADMIN_ID).
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0") or 0)
+if not SUPER_ADMIN_ID and ADMIN_IDS:
+    SUPER_ADMIN_ID = ADMIN_IDS[0]
+
 SITE_URL = os.getenv("SITE_URL", "https://nebula-kungur.netlify.app").strip()
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/anonkiychat_bot").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080") or 8080)
+WEBHOOK_PORT = int(os.getenv("PORT", os.getenv("WEBHOOK_PORT", "8080")))
 
-# ---------- ЛОКАЛЬНЫЕ КАРТИНКИ ----------
-# Файлы лежат в папке img/ рядом с этим скриптом.
-# Можно переопределить через .env (путь к файлу), но по умолчанию берём локальные.
 BASE_DIR = Path(__file__).resolve().parent
 IMG_DIR = BASE_DIR / "img"
 
@@ -72,6 +74,24 @@ def db_init():
             stars INTEGER NOT NULL,
             text TEXT NOT NULL,
             ts INTEGER NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_num TEXT,
+            buyer_id INTEGER NOT NULL,
+            operator_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at INTEGER NOT NULL,
+            closed_at INTEGER
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS operators (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER,
+            added_at INTEGER NOT NULL
         )
     """)
     con.commit()
@@ -119,6 +139,51 @@ def db_last(limit=5):
     ).fetchall()
     con.close()
     return [r[0] for r in rows]
+
+# ---------- Операторы ----------
+def ops_add(user_id: int, added_by: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO operators (user_id, added_by, added_at) VALUES (?,?,?)",
+            (user_id, added_by, int(time.time())),
+        )
+        con.commit()
+        ok = con.total_changes > 0
+    except Exception:
+        ok = False
+    con.close()
+    return ok
+
+def ops_remove(user_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM operators WHERE user_id=?", (user_id,))
+    ok = con.total_changes > 0
+    con.commit()
+    con.close()
+    return ok
+
+def ops_list():
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT user_id, added_by, added_at FROM operators ORDER BY added_at").fetchall()
+    con.close()
+    return rows
+
+def ops_exists(user_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT 1 FROM operators WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
+    con.close()
+    return bool(row)
+
+def is_admin(uid: int) -> bool:
+    if uid == SUPER_ADMIN_ID:
+        return True
+    if uid in ADMIN_IDS:
+        return True
+    return ops_exists(uid)
+
+def is_super(uid: int) -> bool:
+    return uid == SUPER_ADMIN_ID
 
 # ---------- ЧАТЫ ----------
 def chat_create(order_num: str, buyer_id: int):
@@ -200,20 +265,104 @@ def order_has_buyer(order_num: str, buyer_id: int) -> bool:
     ch = chat_get(order_num)
     return bool(ch and ch["buyer_id"] == buyer_id)
 
+# ---------- Обращения ----------
+def ticket_create(order_num: str, buyer_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO tickets (order_num, buyer_id, operator_id, status, created_at) VALUES (?,?,?,?,?)",
+        (order_num or "", buyer_id, None, "open", int(time.time())),
+    )
+    tid = cur.lastrowid
+    con.commit()
+    con.close()
+    return tid
+
+def ticket_get(tid: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, order_num, buyer_id, operator_id, status, created_at, closed_at FROM tickets WHERE id=?",
+        (tid,),
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "order_num": row[1], "buyer_id": row[2],
+        "operator_id": row[3], "status": row[4],
+        "created_at": row[5], "closed_at": row[6],
+    }
+
+def ticket_take(tid: int, operator_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE tickets SET operator_id=?, status='taken' WHERE id=? AND (operator_id IS NULL OR operator_id=?)",
+        (operator_id, tid, operator_id),
+    )
+    con.commit()
+    con.close()
+
+def ticket_close(tid: int):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE tickets SET status='closed', closed_at=? WHERE id=?",
+        (int(time.time()), tid),
+    )
+    con.commit()
+    con.close()
+
+def ticket_by_buyer(buyer_id: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, order_num, buyer_id, operator_id, status, created_at, closed_at FROM tickets WHERE buyer_id=? AND status IN ('open','taken') ORDER BY created_at DESC LIMIT 1",
+        (buyer_id,),
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "order_num": row[1], "buyer_id": row[2],
+        "operator_id": row[3], "status": row[4],
+        "created_at": row[5], "closed_at": row[6],
+    }
+
+def ticket_by_operator(operator_id: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, order_num, buyer_id, operator_id, status, created_at, closed_at FROM tickets WHERE operator_id=? AND status='taken' ORDER BY created_at DESC LIMIT 1",
+        (operator_id,),
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "order_num": row[1], "buyer_id": row[2],
+        "operator_id": row[3], "status": row[4],
+        "created_at": row[5], "closed_at": row[6],
+    }
+
+def tickets_all(status_filter: str = "open"):
+    con = sqlite3.connect(DB_PATH)
+    if status_filter == "all":
+        rows = con.execute(
+            "SELECT id, order_num, buyer_id, operator_id, status, created_at FROM tickets ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id, order_num, buyer_id, operator_id, status, created_at FROM tickets WHERE status=? ORDER BY created_at DESC LIMIT 50",
+            (status_filter,),
+        ).fetchall()
+    con.close()
+    return rows
+
 # ---------- Состояние ожидания ----------
 WAITING = set()
 WAITING_REVIEW = set()
 WAITING_REVIEW_TEXT = {}
-
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+WAITING_OP_ADD = set()
+WAITING_OP_REMOVE = set()
 
 # ---------- Отправка с локальной картинкой ----------
 async def send_photo_safe(target, photo_path: Path, caption: str, kb=None):
-    """
-    Отправка локального файла из img/.
-    Если файла нет или Telegram вернул ошибку — фолбэк на текст.
-    """
     try:
         if photo_path and photo_path.is_file():
             return await bot.send_photo(
@@ -223,8 +372,7 @@ async def send_photo_safe(target, photo_path: Path, caption: str, kb=None):
                 reply_markup=kb,
                 parse_mode="HTML",
             )
-        else:
-            print(f"[send_photo] файл не найден: {photo_path}")
+        print(f"[send_photo] файл не найден: {photo_path}")
     except Exception as e:
         print(f"[send_photo] ошибка {photo_path}: {e}")
     return await bot.send_message(
@@ -285,9 +433,25 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     if SITE_URL:
         rows.append([InlineKeyboardButton(text="🌐 Открыть сайт", url=SITE_URL)])
     rows.append([InlineKeyboardButton(text="🧾 Проверить заказ", callback_data="check_order")])
-    if SUPPORT_URL:
-        rows.append([InlineKeyboardButton(text="💬 Поддержка", url=SUPPORT_URL)])
+    rows.append([InlineKeyboardButton(text="💬 Поддержка", callback_data="support")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def admin_panel_kb(uid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📋 Все обращения", callback_data="admin_tickets")],
+        [InlineKeyboardButton(text="🧾 Последние заказы", callback_data="last_orders")],
+    ]
+    if is_super(uid):
+        rows.append([InlineKeyboardButton(text="👥 Операторы", callback_data="ops_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ops_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить оператора", callback_data="ops_add")],
+        [InlineKeyboardButton(text="➖ Снять оператора", callback_data="ops_remove")],
+        [InlineKeyboardButton(text="📋 Список операторов", callback_data="ops_list")],
+        [InlineKeyboardButton(text="◀ В меню", callback_data="back_menu")],
+    ])
 
 def order_kb(num: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -317,6 +481,41 @@ def op_chat_kb(num: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔒 Закрыть заказ", callback_data=f"close:{num}")],
     ])
 
+def support_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Открыть обращение", callback_data="ticket_open")],
+        [InlineKeyboardButton(text="◀ В меню", callback_data="back_menu")],
+    ])
+
+def ticket_buyer_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Закрыть обращение", callback_data=f"tclose:{tid}")],
+    ])
+
+def ticket_operator_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Закрыть обращение", callback_data=f"tclose:{tid}")],
+    ])
+
+def admin_ticket_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤝 Взять обращение", callback_data=f"ttake:{tid}")],
+    ])
+
+def admin_tickets_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Открытые", callback_data="tlist:open")],
+        [InlineKeyboardButton(text="🟡 В работе", callback_data="tlist:taken")],
+        [InlineKeyboardButton(text="⚪ Закрытые", callback_data="tlist:closed")],
+        [InlineKeyboardButton(text="📋 Все", callback_data="tlist:all")],
+        [InlineKeyboardButton(text="◀ В меню", callback_data="back_menu")],
+    ])
+
+def last_orders_kb(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=n, callback_data=f"lookup:{n}")] for n in rows
+    ] + [[InlineKeyboardButton(text="◀ В меню", callback_data="back_menu")]])
+
 # ---------- Тексты ----------
 def welcome_text() -> str:
     site_line = f"🌐 <b>Сайт:</b> {SITE_URL}" if SITE_URL else "🌐 <b>Сайт:</b> —"
@@ -330,7 +529,7 @@ def welcome_text() -> str:
         "Что можно сделать:\n"
         "• проверить заказ по номеру <code>NEB-XXXXXX-YYYY</code>\n"
         "• открыть сайт и оформить новый заказ\n"
-        "• связаться с поддержкой"
+        "• написать в поддержку (скрины, PDF, чеки)"
     )
 
 # ---------- Хендлеры пользователя ----------
@@ -354,11 +553,20 @@ async def cmd_start(msg: types.Message):
         return
 
     await send_brand(msg.chat.id, welcome_text(), main_menu_kb())
+    if is_admin(msg.from_user.id):
+        await bot.send_message(
+            msg.chat.id,
+            "🛠 <b>Панель оператора</b>",
+            reply_markup=admin_panel_kb(msg.from_user.id),
+            parse_mode="HTML",
+        )
 
 @dp.callback_query(F.data == "back_menu")
 async def cb_back(cb: types.CallbackQuery):
     WAITING.discard(cb.from_user.id)
     WAITING_REVIEW.discard(cb.from_user.id)
+    WAITING_OP_ADD.discard(cb.from_user.id)
+    WAITING_OP_REMOVE.discard(cb.from_user.id)
     try:
         await cb.message.edit_text(welcome_text(), reply_markup=main_menu_kb(), disable_web_page_preview=True)
     except Exception:
@@ -379,6 +587,221 @@ async def cb_check(cb: types.CallbackQuery):
             "🧾 Пришли номер заказа вида <code>NEB-XXXXXX-YYYY</code>.", back_kb())
     await cb.answer()
 
+# ---------- Управление операторами ----------
+@dp.callback_query(F.data == "ops_menu")
+async def cb_ops_menu(cb: types.CallbackQuery):
+    if not is_super(cb.from_user.id):
+        await cb.answer("Только главный админ", show_alert=True)
+        return
+    await cb.answer()
+    try:
+        await cb.message.edit_text(
+            "👥 <b>Управление операторами</b>\n"
+            "Операторы получают доступ к заказам и обращениям, но не могут назначать других.",
+            reply_markup=ops_menu_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await bot.send_message(cb.from_user.id, "👥 <b>Управление операторами</b>", reply_markup=ops_menu_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "ops_add")
+async def cb_ops_add(cb: types.CallbackQuery):
+    if not is_super(cb.from_user.id):
+        await cb.answer("Только главный админ", show_alert=True)
+        return
+    WAITING_OP_ADD.add(cb.from_user.id)
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id,
+        "➕ Отправь <b>ID пользователя</b>, которого нужно назначить оператором.\n"
+        "Пример: <code>123456789</code>",
+        reply_markup=back_kb(),
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data == "ops_remove")
+async def cb_ops_remove(cb: types.CallbackQuery):
+    if not is_super(cb.from_user.id):
+        await cb.answer("Только главный админ", show_alert=True)
+        return
+    WAITING_OP_REMOVE.add(cb.from_user.id)
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id,
+        "➖ Отправь <b>ID оператора</b>, которого нужно снять.\n"
+        "Пример: <code>123456789</code>",
+        reply_markup=back_kb(),
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data == "ops_list")
+async def cb_ops_list(cb: types.CallbackQuery):
+    if not is_super(cb.from_user.id):
+        await cb.answer("Только главный админ", show_alert=True)
+        return
+    rows = ops_list()
+    await cb.answer()
+    if not rows:
+        await cb.message.edit_text("Список операторов пуст.", reply_markup=ops_menu_kb())
+        return
+    lines = []
+    for uid, by, ts in rows:
+        when = time.strftime("%d.%m.%Y", time.localtime(ts))
+        lines.append(f"• <code>{uid}</code> — добавил <code>{by}</code> · {when}")
+    await cb.message.edit_text(
+        "👥 <b>Операторы</b>\n\n" + "\n".join(lines),
+        reply_markup=ops_menu_kb(),
+        parse_mode="HTML",
+    )
+
+# ---------- Поддержка / обращения ----------
+@dp.callback_query(F.data == "support")
+async def cb_support(cb: types.CallbackQuery):
+    t = ticket_by_buyer(cb.from_user.id)
+    await cb.answer()
+    if t and t["status"] in ("open", "taken"):
+        await bot.send_message(
+            cb.from_user.id,
+            f"💬 У вас уже есть активное обращение <b>#{t['id']}</b>.\n"
+            "Можете отправить сообщение или файл (фото/PDF/чек) — оператор увидит.",
+            reply_markup=ticket_buyer_kb(t["id"]),
+            parse_mode="HTML",
+        )
+        return
+    await bot.send_message(
+        cb.from_user.id,
+        "💬 <b>Поддержка</b>\n"
+        "Опишите проблему и при необходимости приложите скрин или PDF-чек.\n"
+        "Можно отправлять фото и документы.",
+        reply_markup=support_kb(),
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data == "ticket_open")
+async def cb_ticket_open(cb: types.CallbackQuery):
+    t = ticket_by_buyer(cb.from_user.id)
+    if t and t["status"] in ("open", "taken"):
+        await cb.answer("Уже есть активное обращение", show_alert=True)
+        return
+    tid = ticket_create("", cb.from_user.id)
+    await cb.answer("Обращение создано")
+    for op in set(ADMIN_IDS + [SUPER_ADMIN_ID]):
+        try:
+            await bot.send_message(
+                op,
+                f"🆘 <b>Новое обращение #{tid}</b>\n"
+                f"Покупатель: <code>{cb.from_user.id}</code>",
+                reply_markup=admin_ticket_kb(tid),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    try:
+        await cb.message.edit_text(
+            f"✅ Обращение <b>#{tid}</b> создано.\n"
+            "Опишите проблему и приложите скрин/PDF — оператор подключится.",
+            reply_markup=ticket_buyer_kb(tid),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("ttake:"))
+async def cb_ticket_take(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    tid = int(cb.data.split(":", 1)[1])
+    t = ticket_get(tid)
+    if not t:
+        await cb.answer("Обращение не найдено", show_alert=True)
+        return
+    if t["operator_id"] and t["operator_id"] != cb.from_user.id:
+        await cb.answer("Уже взято другим оператором", show_alert=True)
+        return
+    ticket_take(tid, cb.from_user.id)
+    await cb.answer("Взято")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await bot.send_message(
+        cb.from_user.id,
+        f"🤝 Вы взяли обращение <b>#{tid}</b>.\nПокупатель: <code>{t['buyer_id']}</code>",
+        reply_markup=ticket_operator_kb(tid),
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(
+            t["buyer_id"],
+            f"👤 Оператор подключился к обращению <b>#{tid}</b>. Пришлите скрины/PDF/чек.",
+            reply_markup=ticket_buyer_kb(tid),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("tclose:"))
+async def cb_ticket_close(cb: types.CallbackQuery):
+    tid = int(cb.data.split(":", 1)[1])
+    t = ticket_get(tid)
+    if not t:
+        await cb.answer("Обращение не найдено", show_alert=True)
+        return
+    if cb.from_user.id not in (t["buyer_id"], t["operator_id"]) and not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    ticket_close(tid)
+    await cb.answer("Обращение закрыто")
+    try:
+        await cb.message.edit_text(f"🔒 Обращение <b>#{tid}</b> закрыто.", reply_markup=back_kb(), parse_mode="HTML")
+    except Exception:
+        pass
+    for uid in {t["buyer_id"], t["operator_id"]}:
+        if uid and uid != cb.from_user.id:
+            try:
+                await bot.send_message(uid, f"🔒 Обращение <b>#{tid}</b> закрыто.", parse_mode="HTML")
+            except Exception:
+                pass
+
+@dp.callback_query(F.data == "admin_tickets")
+async def cb_admin_tickets(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    await cb.answer()
+    try:
+        await cb.message.edit_text(
+            "📋 <b>Все обращения</b>\nВыберите фильтр:",
+            reply_markup=admin_tickets_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await bot.send_message(cb.from_user.id, "📋 <b>Все обращения</b>", reply_markup=admin_tickets_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("tlist:"))
+async def cb_tickets_list(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    flt = cb.data.split(":", 1)[1]
+    rows = tickets_all(flt)
+    if not rows:
+        await cb.answer("Пусто", show_alert=True)
+        return
+    lines = []
+    for r in rows:
+        tid, num, buyer, op, status, ts = r
+        st = {"open": "🟢", "taken": "🟡", "closed": "⚪"}.get(status, "")
+        lines.append(f"{st} #{tid} · {num or '—'} · buyer <code>{buyer}</code> · op {op or '—'}")
+    await cb.message.edit_text(
+        f"📋 <b>Обращения ({flt})</b>\n\n" + "\n".join(lines),
+        reply_markup=back_kb(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+# ---------- Заказы ----------
 @dp.callback_query(F.data.startswith("order_confirm:"))
 async def cb_order_confirm(cb: types.CallbackQuery):
     num = cb.data.split(":", 1)[1]
@@ -388,7 +811,7 @@ async def cb_order_confirm(cb: types.CallbackQuery):
         return
     chat_create(num, cb.from_user.id)
     await cb.answer("Заказ отправлен оператору")
-    for op in ADMIN_IDS:
+    for op in set(ADMIN_IDS + [SUPER_ADMIN_ID]):
         try:
             await send_operator(
                 op,
@@ -480,6 +903,31 @@ async def cb_close(cb: types.CallbackQuery):
     except Exception:
         pass
 
+@dp.callback_query(F.data == "last_orders")
+async def cb_last(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    rows = db_last(5)
+    await cb.answer()
+    if not rows:
+        await cb.message.edit_text("Пока ни одного заказа.", reply_markup=back_kb())
+        return
+    await cb.message.edit_text("Последние 5 заказов:", reply_markup=last_orders_kb(rows))
+
+@dp.callback_query(F.data.startswith("lookup:"))
+async def cb_lookup(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    num = cb.data.split(":", 1)[1]
+    order = db_get(num)
+    if order:
+        await cb.message.edit_text(fmt_order(order), reply_markup=back_kb())
+    else:
+        await cb.message.edit_text(f"❓ Заказ <b>{num}</b> не найден.", reply_markup=back_kb())
+    await cb.answer()
+
 @dp.callback_query(F.data.startswith("review:"))
 async def cb_review(cb: types.CallbackQuery):
     num = cb.data.split(":", 1)[1]
@@ -520,29 +968,68 @@ async def cmd_last(msg: types.Message):
     if not rows:
         await msg.answer("Пока ни одного заказа.")
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=n, callback_data=f"lookup:{n}")] for n in rows
-    ])
-    await msg.answer("Последние 5 заказов:", reply_markup=kb)
+    await msg.answer("Последние 5 заказов:", reply_markup=last_orders_kb(rows))
 
-@dp.callback_query(F.data.startswith("lookup:"))
-async def cb_lookup(cb: types.CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Недостаточно прав", show_alert=True)
-        return
-    num = cb.data.split(":", 1)[1]
-    order = db_get(num)
-    if order:
-        await cb.message.edit_text(fmt_order(order), reply_markup=back_kb())
-    else:
-        await cb.message.edit_text(f"❓ Заказ <b>{num}</b> не найден.", reply_markup=back_kb())
-    await cb.answer()
-
-# ---------- Переписка покупатель ↔ оператор ----------
+# ---------- Универсальный роутер ----------
 @dp.message()
 async def msg_router(msg: types.Message):
     uid = msg.from_user.id
 
+    # --- назначение оператора ---
+    if uid in WAITING_OP_ADD:
+        WAITING_OP_ADD.discard(uid)
+        if not is_super(uid):
+            await msg.answer("Только главный админ.")
+            return
+        txt = (msg.text or "").strip()
+        if not txt.isdigit():
+            await msg.answer("Нужен числовой ID. Пример: <code>123456789</code>", parse_mode="HTML")
+            return
+        target = int(txt)
+        if target == SUPER_ADMIN_ID:
+            await msg.answer("Это главный админ, он уже имеет доступ.")
+            return
+        ok = ops_add(target, uid)
+        if ok:
+            await msg.answer(f"✅ Пользователь <code>{target}</code> назначен оператором.", parse_mode="HTML")
+            try:
+                await bot.send_message(
+                    target,
+                    "🛠 Вам выдан доступ оператора NEBULA.\n"
+                    "Откройте /start — появится панель оператора.",
+                )
+            except Exception:
+                pass
+        else:
+            await msg.answer(f"Пользователь <code>{target}</code> уже оператор.", parse_mode="HTML")
+        return
+
+    # --- снятие оператора ---
+    if uid in WAITING_OP_REMOVE:
+        WAITING_OP_REMOVE.discard(uid)
+        if not is_super(uid):
+            await msg.answer("Только главный админ.")
+            return
+        txt = (msg.text or "").strip()
+        if not txt.isdigit():
+            await msg.answer("Нужен числовой ID. Пример: <code>123456789</code>", parse_mode="HTML")
+            return
+        target = int(txt)
+        if target == SUPER_ADMIN_ID:
+            await msg.answer("Главного админа снять нельзя.")
+            return
+        ok = ops_remove(target)
+        if ok:
+            await msg.answer(f"✅ Пользователь <code>{target}</code> больше не оператор.", parse_mode="HTML")
+            try:
+                await bot.send_message(target, "🛠 Ваш доступ оператора NEBULA снят.")
+            except Exception:
+                pass
+        else:
+            await msg.answer(f"Пользователь <code>{target}</code> не найден в списке операторов.", parse_mode="HTML")
+        return
+
+    # --- ждём номер заказа ---
     if uid in WAITING:
         WAITING.discard(uid)
         num = (msg.text or "").strip().upper()
@@ -556,6 +1043,7 @@ async def msg_router(msg: types.Message):
                 back_kb())
         return
 
+    # --- отзыв ---
     for num, st in list(WAITING_REVIEW_TEXT.items()):
         if st.get("buyer") == uid:
             text = (msg.text or "").strip()
@@ -578,7 +1066,7 @@ async def msg_router(msg: types.Message):
                 "<i>Скидка 15% на следующий заказ закреплена за вашим заказом.</i>",
                 parse_mode="HTML",
             )
-            for op in ADMIN_IDS:
+            for op in set(ADMIN_IDS + [SUPER_ADMIN_ID]):
                 try:
                     await bot.send_message(
                         op,
@@ -591,20 +1079,82 @@ async def msg_router(msg: types.Message):
                     pass
             return
 
+    # --- вложения ---
+    is_media = bool(msg.photo or msg.document or msg.video or msg.audio or msg.voice or msg.sticker)
+    if is_media:
+        t = ticket_by_buyer(uid)
+        if t and t["operator_id"]:
+            try:
+                await bot.copy_message(chat_id=t["operator_id"], from_chat_id=msg.chat.id, message_id=msg.message_id)
+                await bot.send_message(t["operator_id"], f"📎 Вложение по обращению <b>#{t['id']}</b> от <code>{uid}</code>", parse_mode="HTML")
+                await msg.answer("📎 Отправлено оператору.")
+            except Exception as e:
+                await msg.answer(f"Не удалось отправить: {e}")
+            return
+
+        ch = chat_by_buyer(uid)
+        if ch and ch["operator_id"]:
+            try:
+                await bot.copy_message(chat_id=ch["operator_id"], from_chat_id=msg.chat.id, message_id=msg.message_id)
+                await msg.answer("📎 Отправлено оператору.")
+            except Exception as e:
+                await msg.answer(f"Не удалось отправить: {e}")
+            return
+
+        if is_admin(uid):
+            to = ticket_by_operator(uid)
+            if to:
+                try:
+                    await bot.copy_message(chat_id=to["buyer_id"], from_chat_id=msg.chat.id, message_id=msg.message_id)
+                    await msg.answer("📎 Отправлено покупателю.")
+                except Exception as e:
+                    await msg.answer(f"Не удалось отправить: {e}")
+                return
+            ch2 = chat_by_operator(uid)
+            if ch2:
+                try:
+                    await bot.copy_message(chat_id=ch2["buyer_id"], from_chat_id=msg.chat.id, message_id=msg.message_id)
+                    await msg.answer("📎 Отправлено покупателю.")
+                except Exception as e:
+                    await msg.answer(f"Не удалось отправить: {e}")
+                return
+
+        await msg.answer("📎 Сначала откройте обращение в разделе «Поддержка».")
+        return
+
+    # --- оператор текстом ---
     if is_admin(uid):
+        to = ticket_by_operator(uid)
+        if to:
+            try:
+                await bot.send_message(to["buyer_id"], f"👤 <b>Оператор (обращение #{to['id']}):</b>\n{msg.text or ''}", parse_mode="HTML")
+                await msg.answer("✉️ Отправлено покупателю.")
+            except Exception as e:
+                await msg.answer(f"Не удалось отправить: {e}")
+            return
         ch = chat_by_operator(uid)
         if ch:
             try:
-                await bot.send_message(
-                    ch["buyer_id"],
-                    f"👤 <b>Оператор:</b>\n{msg.text or ''}",
-                    parse_mode="HTML",
-                )
+                await bot.send_message(ch["buyer_id"], f"👤 <b>Оператор:</b>\n{msg.text or ''}", parse_mode="HTML")
                 await msg.answer("✉️ Отправлено покупателю.")
             except Exception as e:
                 await msg.answer(f"Не удалось отправить: {e}")
             return
         await send_brand(msg.chat.id, welcome_text(), main_menu_kb())
+        await bot.send_message(msg.chat.id, "🛠 <b>Панель оператора</b>", reply_markup=admin_panel_kb(uid), parse_mode="HTML")
+        return
+
+    # --- покупатель текстом ---
+    t = ticket_by_buyer(uid)
+    if t:
+        if not t["operator_id"]:
+            await msg.answer("⏳ Оператор ещё не подключился к обращению. Подожди немного.")
+            return
+        try:
+            await bot.send_message(t["operator_id"], f"👤 <b>Покупатель (обращение #{t['id']}):</b>\n{msg.text or ''}", parse_mode="HTML")
+            await msg.answer("✉️ Отправлено оператору.")
+        except Exception as e:
+            await msg.answer(f"Не удалось отправить: {e}")
         return
 
     ch = chat_by_buyer(uid)
@@ -613,11 +1163,7 @@ async def msg_router(msg: types.Message):
             await msg.answer("⏳ Оператор ещё не подключился. Подожди немного.")
             return
         try:
-            await bot.send_message(
-                ch["operator_id"],
-                f"👤 <b>Покупатель</b> ({ch['order_num']}):\n{msg.text or ''}",
-                parse_mode="HTML",
-            )
+            await bot.send_message(ch["operator_id"], f"👤 <b>Покупатель</b> ({ch['order_num']}):\n{msg.text or ''}", parse_mode="HTML")
             await msg.answer("✉️ Отправлено оператору.")
         except Exception as e:
             await msg.answer(f"Не удалось отправить: {e}")
@@ -625,21 +1171,35 @@ async def msg_router(msg: types.Message):
 
     await send_brand(msg.chat.id, welcome_text(), main_menu_kb())
 
-# ---------- HTTP webhook от сайта ----------
+# ---------- HTTP webhook ----------
 def check_secret(request: web.Request) -> bool:
     return request.headers.get("X-Secret", "") == WEBHOOK_SECRET
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, X-Secret",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+}
+
 async def handle_order(request: web.Request):
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS_HEADERS)
     if not check_secret(request):
-        return web.json_response({"ok": False, "err": "bad secret"}, status=403)
+        resp = web.json_response({"ok": False, "err": "bad secret"}, status=403)
+        resp.headers.update(CORS_HEADERS)
+        return resp
     try:
         data = await request.json()
     except Exception:
-        return web.json_response({"ok": False, "err": "bad json"}, status=400)
+        resp = web.json_response({"ok": False, "err": "bad json"}, status=400)
+        resp.headers.update(CORS_HEADERS)
+        return resp
 
     num = str(data.get("num", "")).strip().upper()
     if not num.startswith("NEB-"):
-        return web.json_response({"ok": False, "err": "bad num"}, status=400)
+        resp = web.json_response({"ok": False, "err": "bad num"}, status=400)
+        resp.headers.update(CORS_HEADERS)
+        return resp
 
     order = {
         "num": num,
@@ -650,8 +1210,9 @@ async def handle_order(request: web.Request):
         "items": data.get("items", []),
     }
     db_save(order)
+    print(f"[webhook] saved order {num}, total={order['total']}, items={len(order['items'])}")
 
-    for op in ADMIN_IDS:
+    for op in set(ADMIN_IDS + [SUPER_ADMIN_ID]):
         try:
             await send_operator(
                 op,
@@ -664,26 +1225,18 @@ async def handle_order(request: web.Request):
         except Exception as e:
             print("admin notify failed:", e)
 
-    return web.json_response({"ok": True, "num": num})
+    resp = web.json_response({"ok": True, "num": num})
+    resp.headers.update(CORS_HEADERS)
+    return resp
 
 async def handle_health(request: web.Request):
     return web.json_response({"ok": True, "time": int(time.time())})
 
 def make_app():
     app = web.Application()
+    app.router.add_route("OPTIONS", "/order", handle_order)
     app.router.add_post("/order", handle_order)
     app.router.add_get("/health", handle_health)
-
-    cors = aiohttp_cors.setup(app, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=False,
-            expose_headers="*",
-            allow_headers=("Content-Type", "X-Secret"),
-            allow_methods=("POST", "OPTIONS"),
-        )
-    })
-    for route in list(app.router.routes()):
-        cors.add(route)
     return app
 
 # ---------- Запуск ----------
@@ -695,10 +1248,12 @@ async def main():
     logger.info("starting bot…")
     logger.info(f"BOT_TOKEN present: {bool(BOT_TOKEN)}")
     logger.info(f"ADMIN_IDS: {ADMIN_IDS}")
+    logger.info(f"SUPER_ADMIN_ID: {SUPER_ADMIN_ID}")
     logger.info(f"IMG_DIR: {IMG_DIR}")
     logger.info(f"BRAND_PHOTO:    {BRAND_PHOTO} (exists={BRAND_PHOTO.is_file()})")
     logger.info(f"OPERATOR_PHOTO: {OPERATOR_PHOTO} (exists={OPERATOR_PHOTO.is_file()})")
     logger.info(f"ORDER_PHOTO:    {ORDER_PHOTO} (exists={ORDER_PHOTO.is_file()})")
+    logger.info(f"DB_PATH: {DB_PATH}")
 
     db_init()
     logger.info("db initialized")
