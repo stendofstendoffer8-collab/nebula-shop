@@ -277,16 +277,36 @@ def make_app():
     return app
 
 # ---------- Запуск ----------
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 async def main():
+    logger.info("starting bot…")
+    logger.info(f"BOT_TOKEN present: {bool(BOT_TOKEN)}")
+    logger.info(f"ADMIN_ID: {ADMIN_ID}")
+
     db_init()
-    print("bot starting…")
+    logger.info("db initialized")
+
     app = make_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
-    print(f"webhook on :{WEBHOOK_PORT}")
-    await dp.start_polling(bot)
+    logger.info(f"webhook on :{WEBHOOK_PORT}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        me = await bot.get_me()
+        logger.info(f"bot connected: @{me.username} (id={me.id})")
+    except Exception as e:
+        logger.error(f"bot connection failed: {e}")
+        return
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"delete_webhook: {e}")
+
+    logger.info("starting polling…")
+    await dp.start_polling(bot)
