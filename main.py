@@ -628,7 +628,26 @@ async def msg_router(msg: types.Message):
 def check_secret(request: web.Request) -> bool:
     return request.headers.get("X-Secret", "") == WEBHOOK_SECRET
 
+_CORS_ORIGIN = (SITE_URL or "https://nebula-kungur.netlify.app").rstrip("/")
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": _CORS_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Secret",
+}
+
+async def handle_order_options(request: web.Request):
+    return web.Response(status=204, headers=CORS_HEADERS)
+
 async def handle_order(request: web.Request):
+    try:
+        resp = await _handle_order(request)
+    except web.HTTPException as e:
+        e.headers.update(CORS_HEADERS)
+        raise
+    resp.headers.update(CORS_HEADERS)
+    return resp
+
+async def _handle_order(request: web.Request):
     if not check_secret(request):
         return web.json_response({"ok": False, "err": "bad secret"}, status=403)
     try:
@@ -649,6 +668,7 @@ async def handle_order(request: web.Request):
         "items": data.get("items", []),
     }
     db_save(order)
+    print(f"New order #{num}", flush=True)
 
     for op in ADMIN_IDS:
         try:
@@ -671,6 +691,7 @@ async def handle_health(request: web.Request):
 def make_app():
     app = web.Application()
     app.router.add_post("/order", handle_order)
+    app.router.add_route("OPTIONS", "/order", handle_order_options)
     app.router.add_get("/health", handle_health)
     return app
 
