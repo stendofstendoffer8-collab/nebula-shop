@@ -17,11 +17,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 bot = Bot(token=BOT_TOKEN)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 SITE_URL = os.getenv("SITE_URL", "https://nebula-kungur.netlify.app").strip()
-SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
+SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/anonkiychat_bot").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080") or 8080)
 
-DB_PATH = Path(__file__).parent / "orders.db"
+DB_PATH = Path(os.getenv("DB_PATH", "/data/orders.db"))
 
 # ---------- БД ----------
 def db_init():
