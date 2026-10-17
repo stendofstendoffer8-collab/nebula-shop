@@ -8,7 +8,7 @@ from pathlib import Path
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +24,7 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/anonkiychat_bot").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080") or 8080)
 
+<<<<<<< HEAD
 # ---------- FILE_ID картинок ----------
 # Впиши сюда file_id, полученные от СВОЕГО бота (см. инструкцию).
 # Можно оставить пустым — тогда будет отправляться текст без фото.
@@ -36,6 +37,17 @@ ORDER_PHOTO    = os.getenv("ORDER_PHOTO", "").strip()      # оформлени�
 # BRAND_PHOTO    = "AgACAgIAAxkBAAI..."
 # OPERATOR_PHOTO = "AgACAgIAAxkBAAI..."
 # ORDER_PHOTO    = "AgACAgIAAxkBAAI..."
+=======
+# ---------- ЛОКАЛЬНЫЕ КАРТИНКИ ----------
+# Файлы лежат в папке img/ рядом с этим скриптом.
+# Можно переопределить через .env (путь к файлу), но по умолчанию берём локальные.
+BASE_DIR = Path(__file__).resolve().parent
+IMG_DIR = BASE_DIR / "img"
+
+BRAND_PHOTO    = Path(os.getenv("BRAND_PHOTO",    str(IMG_DIR / "brand.jpg")))
+OPERATOR_PHOTO = Path(os.getenv("OPERATOR_PHOTO", str(IMG_DIR / "operator.jpg")))
+ORDER_PHOTO    = Path(os.getenv("ORDER_PHOTO",    str(IMG_DIR / "order.jpg")))
+>>>>>>> a2924bfdfc71c697d65025ba2ea18821cdc8c188
 
 DB_PATH = Path(os.getenv("DB_PATH", "/data/orders.db"))
 
@@ -210,6 +222,7 @@ WAITING_REVIEW_TEXT = {}
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
+<<<<<<< HEAD
 # ---------- Отправка с картинкой (file_id) ----------
 async def send_photo_safe(target, photo: str, caption: str, kb=None):
     """
@@ -224,6 +237,27 @@ async def send_photo_safe(target, photo: str, caption: str, kb=None):
             )
         except Exception as e:
             print("send_photo failed, fallback to text:", e)
+=======
+# ---------- Отправка с локальной картинкой ----------
+async def send_photo_safe(target, photo_path: Path, caption: str, kb=None):
+    """
+    Отправка локального файла из img/.
+    Если файла нет или Telegram вернул ошибку — фолбэк на текст.
+    """
+    try:
+        if photo_path and photo_path.is_file():
+            return await bot.send_photo(
+                target,
+                photo=FSInputFile(str(photo_path)),
+                caption=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        else:
+            print(f"[send_photo] файл не найден: {photo_path}")
+    except Exception as e:
+        print(f"[send_photo] ошибка {photo_path}: {e}")
+>>>>>>> a2924bfdfc71c697d65025ba2ea18821cdc8c188
     return await bot.send_message(
         target, caption, reply_markup=kb,
         disable_web_page_preview=True, parse_mode="HTML",
@@ -233,10 +267,19 @@ async def send_brand(target, text: str, kb=None):
     await send_photo_safe(target, BRAND_PHOTO, text, kb)
 
 async def send_order(target, text: str, kb=None):
+<<<<<<< HEAD
     await send_photo_safe(target, ORDER_PHOTO or BRAND_PHOTO, text, kb)
 
 async def send_operator(target, text: str, kb=None):
     await send_photo_safe(target, OPERATOR_PHOTO or BRAND_PHOTO, text, kb)
+=======
+    photo = ORDER_PHOTO if ORDER_PHOTO.is_file() else BRAND_PHOTO
+    await send_photo_safe(target, photo, text, kb)
+
+async def send_operator(target, text: str, kb=None):
+    photo = OPERATOR_PHOTO if OPERATOR_PHOTO.is_file() else BRAND_PHOTO
+    await send_photo_safe(target, photo, text, kb)
+>>>>>>> a2924bfdfc71c697d65025ba2ea18821cdc8c188
 
 # ---------- Форматирование ----------
 def fmt_order(o: dict) -> str:
@@ -679,9 +722,16 @@ async def main():
     logger.info("starting bot…")
     logger.info(f"BOT_TOKEN present: {bool(BOT_TOKEN)}")
     logger.info(f"ADMIN_IDS: {ADMIN_IDS}")
+<<<<<<< HEAD
     logger.info(f"BRAND_PHOTO set: {bool(BRAND_PHOTO)}")
     logger.info(f"OPERATOR_PHOTO set: {bool(OPERATOR_PHOTO)}")
     logger.info(f"ORDER_PHOTO set: {bool(ORDER_PHOTO)}")
+=======
+    logger.info(f"IMG_DIR: {IMG_DIR}")
+    logger.info(f"BRAND_PHOTO:    {BRAND_PHOTO} (exists={BRAND_PHOTO.is_file()})")
+    logger.info(f"OPERATOR_PHOTO: {OPERATOR_PHOTO} (exists={OPERATOR_PHOTO.is_file()})")
+    logger.info(f"ORDER_PHOTO:    {ORDER_PHOTO} (exists={ORDER_PHOTO.is_file()})")
+>>>>>>> a2924bfdfc71c697d65025ba2ea18821cdc8c188
 
     db_init()
     logger.info("db initialized")
@@ -709,4 +759,8 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     asyncio.run(main())ч
+=======
+    asyncio.run(main())
+>>>>>>> a2924bfdfc71c697d65025ba2ea18821cdc8c188
