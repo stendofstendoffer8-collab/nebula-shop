@@ -21,7 +21,7 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080") or 8080)
 
-DB_PATH = Path(__file__).parent / "orders.db"
+DB_PATH = Path(os.getenv("DB_PATH", "/data/orders.db"))
 
 # ---------- БД ----------
 def db_init():
