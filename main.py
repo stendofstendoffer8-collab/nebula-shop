@@ -13,8 +13,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8722729358:AAF0nXYgfvExidrAGyQ9E_KenJ52Kjmj5K4").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8593215463") or 0)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+bot = Bot(token=BOT_TOKEN)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 SITE_URL = os.getenv("SITE_URL", "https://nebula-kungur.netlify.app").strip()
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nebula_secret").strip()
