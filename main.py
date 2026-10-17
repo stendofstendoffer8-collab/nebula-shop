@@ -19,8 +19,6 @@ ADMIN_IDS = [int(x) for x in (os.getenv("ADMIN_IDS", "") or "").replace(" ", "")
 if not ADMIN_IDS and ADMIN_ID:
     ADMIN_IDS = [ADMIN_ID]
 
-# Главный админ — тот, кто может назначать/снимать операторов.
-# По умолчанию — первый из ADMIN_IDS (или ADMIN_ID).
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0") or 0)
 if not SUPER_ADMIN_ID and ADMIN_IDS:
     SUPER_ADMIN_ID = ADMIN_IDS[0]
@@ -92,6 +90,18 @@ def db_init():
             user_id INTEGER PRIMARY KEY,
             added_by INTEGER,
             added_at INTEGER NOT NULL
+        )
+    """)
+    # отзывы об операторе (внутренние, без скидки)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS operator_ratings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_num TEXT NOT NULL,
+            buyer_id INTEGER NOT NULL,
+            operator_id INTEGER,
+            stars INTEGER NOT NULL,
+            text TEXT,
+            ts INTEGER NOT NULL
         )
     """)
     con.commit()
@@ -215,6 +225,12 @@ def chat_take(order_num: str, operator_id: int):
     con.commit()
     con.close()
 
+def chat_close(order_num: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE chats SET status='closed' WHERE order_num=?", (order_num,))
+    con.commit()
+    con.close()
+
 def chat_by_buyer(buyer_id: int):
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
@@ -237,7 +253,7 @@ def chat_by_operator(operator_id: int):
         return None
     return {"order_num": row[0], "buyer_id": row[1], "operator_id": row[2], "status": row[3]}
 
-# ---------- Отзывы ----------
+# ---------- Отзывы сайта (со скидкой) ----------
 def review_add(order_num: str, buyer_id: int, nick: str, city: str, stars: int, text: str):
     con = sqlite3.connect(DB_PATH)
     con.execute(
@@ -264,6 +280,45 @@ def order_has_buyer(order_num: str, buyer_id: int) -> bool:
         return True
     ch = chat_get(order_num)
     return bool(ch and ch["buyer_id"] == buyer_id)
+
+# ---------- Отзыв об операторе (без скидки) ----------
+def rating_add(order_num: str, buyer_id: int, operator_id: int, stars: int, text: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT INTO operator_ratings (order_num, buyer_id, operator_id, stars, text, ts) VALUES (?,?,?,?,?,?)",
+        (order_num, buyer_id, operator_id, stars, text, int(time.time())),
+    )
+    con.commit()
+    con.close()
+
+def rating_has(order_num: str, buyer_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT 1 FROM operator_ratings WHERE order_num=? AND buyer_id=? LIMIT 1",
+        (order_num, buyer_id),
+    ).fetchone()
+    con.close()
+    return bool(row)
+
+def rating_stats(operator_id: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT COUNT(*), AVG(stars) FROM operator_ratings WHERE operator_id=?",
+        (operator_id,),
+    ).fetchone()
+    con.close()
+    cnt = row[0] or 0
+    avg = round(row[1], 2) if row[1] is not None else 0
+    return cnt, avg
+
+def rating_last(operator_id: int, limit: int = 10):
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT order_num, buyer_id, stars, text, ts FROM operator_ratings WHERE operator_id=? ORDER BY ts DESC LIMIT ?",
+        (operator_id, limit),
+    ).fetchall()
+    con.close()
+    return rows
 
 # ---------- Обращения ----------
 def ticket_create(order_num: str, buyer_id: int) -> int:
@@ -360,6 +415,7 @@ WAITING_REVIEW = set()
 WAITING_REVIEW_TEXT = {}
 WAITING_OP_ADD = set()
 WAITING_OP_REMOVE = set()
+WAITING_RATE = {}  # order_num -> {"buyer": uid, "op": operator_id}
 
 # ---------- Отправка с локальной картинкой ----------
 async def send_photo_safe(target, photo_path: Path, caption: str, kb=None):
@@ -475,10 +531,28 @@ def buyer_chat_kb(num: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{num}")],
     ])
 
+def buyer_closed_kb(num: str) -> InlineKeyboardMarkup:
+    # после закрытия заказа: оценить оператора (без скидки) + сайт-отзыв (со скидкой)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Оценить оператора", callback_data=f"rate:{num}")],
+        [InlineKeyboardButton(text="📝 Отзыв на сайте (+15%)", callback_data=f"review:{num}")],
+    ])
+
 def op_chat_kb(num: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Написать покупателю", callback_data=f"to_buyer:{num}")],
         [InlineKeyboardButton(text="🔒 Закрыть заказ", callback_data=f"close:{num}")],
+    ])
+
+def rate_stars_kb(num: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1★", callback_data=f"rate_set:{num}:1"),
+            InlineKeyboardButton(text="2★", callback_data=f"rate_set:{num}:2"),
+            InlineKeyboardButton(text="3★", callback_data=f"rate_set:{num}:3"),
+            InlineKeyboardButton(text="4★", callback_data=f"rate_set:{num}:4"),
+            InlineKeyboardButton(text="5★", callback_data=f"rate_set:{num}:5"),
+        ],
     ])
 
 def support_kb() -> InlineKeyboardMarkup:
@@ -587,6 +661,67 @@ async def cb_check(cb: types.CallbackQuery):
             "🧾 Пришли номер заказа вида <code>NEB-XXXXXX-YYYY</code>.", back_kb())
     await cb.answer()
 
+# ---------- Оценка оператора (без скидки) ----------
+@dp.callback_query(F.data.startswith("rate:"))
+async def cb_rate(cb: types.CallbackQuery):
+    num = cb.data.split(":", 1)[1]
+    ch = chat_get(num)
+    if not ch or ch["buyer_id"] != cb.from_user.id:
+        await cb.answer("Это не ваш заказ", show_alert=True)
+        return
+    if rating_has(num, cb.from_user.id):
+        await cb.answer("Вы уже оценили оператора по этому заказу", show_alert=True)
+        return
+    if not ch["operator_id"]:
+        await cb.answer("Оператор по заказу не назначен", show_alert=True)
+        return
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id,
+        f"⭐ <b>Оценка оператора</b> по заказу <b>{num}</b>\n"
+        "Выберите количество звёзд:",
+        reply_markup=rate_stars_kb(num),
+        parse_mode="HTML",
+    )
+
+@dp.callback_query(F.data.startswith("rate_set:"))
+async def cb_rate_set(cb: types.CallbackQuery):
+    _, num, stars_s = cb.data.split(":", 2)
+    stars = int(stars_s)
+    ch = chat_get(num)
+    if not ch or ch["buyer_id"] != cb.from_user.id:
+        await cb.answer("Это не ваш заказ", show_alert=True)
+        return
+    if rating_has(num, cb.from_user.id):
+        await cb.answer("Вы уже оценили оператора по этому заказу", show_alert=True)
+        return
+    op_id = ch["operator_id"]
+    if not op_id:
+        await cb.answer("Оператор по заказу не назначен", show_alert=True)
+        return
+    rating_add(num, cb.from_user.id, op_id, stars, "")
+    await cb.answer("Спасибо за оценку")
+    try:
+        await cb.message.edit_text(
+            f"✅ Спасибо! Вы поставили <b>{'★'*stars}{'☆'*(5-stars)}</b> оператору по заказу <b>{num}</b>.",
+            reply_markup=None,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    cnt, avg = rating_stats(op_id)
+    try:
+        await bot.send_message(
+            op_id,
+            f"⭐ <b>Новая оценка от покупателя</b>\n"
+            f"Заказ: <b>{num}</b>\n"
+            f"Оценка: {'★'*stars}{'☆'*(5-stars)}\n"
+            f"Средний рейтинг: <b>{avg}</b> ({cnt} оценок)",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
 # ---------- Управление операторами ----------
 @dp.callback_query(F.data == "ops_menu")
 async def cb_ops_menu(cb: types.CallbackQuery):
@@ -647,7 +782,8 @@ async def cb_ops_list(cb: types.CallbackQuery):
     lines = []
     for uid, by, ts in rows:
         when = time.strftime("%d.%m.%Y", time.localtime(ts))
-        lines.append(f"• <code>{uid}</code> — добавил <code>{by}</code> · {when}")
+        cnt, avg = rating_stats(uid)
+        lines.append(f"• <code>{uid}</code> — добавил <code>{by}</code> · {when} · ⭐ {avg} ({cnt})")
     await cb.message.edit_text(
         "👥 <b>Операторы</b>\n\n" + "\n".join(lines),
         reply_markup=ops_menu_kb(),
@@ -893,15 +1029,44 @@ async def cb_close(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Недостаточно прав", show_alert=True)
         return
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE chats SET status='closed' WHERE order_num=?", (num,))
-    con.commit()
-    con.close()
+    ch = chat_get(num)
+    if not ch:
+        await cb.answer("Заказ не найден", show_alert=True)
+        return
+    chat_close(num)
     await cb.answer("Заказ закрыт")
+
+    # оператору — подтверждение
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+    # покупателю — уведомление о закрытии + кнопки «оценить оператора» и «отзыв на сайте (+15%)»
+    try:
+        await send_operator(
+            ch["buyer_id"],
+            f"🔒 <b>Заказ {num} закрыт.</b>\n\n"
+            "Спасибо за заказ! Можете оценить работу оператора "
+            "(это внутренняя оценка, без скидки) или оставить отзыв на сайте — "
+            "за отзыв на сайте начисляется <b>15% скидка</b> на следующий заказ.",
+            buyer_closed_kb(num),
+        )
+    except Exception as e:
+        print("notify buyer close failed:", e)
+
+    # оператору — оценка (если есть)
+    if ch["operator_id"]:
+        cnt, avg = rating_stats(ch["operator_id"])
+        try:
+            await bot.send_message(
+                ch["operator_id"],
+                f"🔒 Заказ <b>{num}</b> закрыт.\n"
+                f"Средний рейтинг: <b>{avg}</b> ({cnt} оценок)",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "last_orders")
 async def cb_last(cb: types.CallbackQuery):
@@ -941,10 +1106,11 @@ async def cb_review(cb: types.CallbackQuery):
     await cb.answer()
     await bot.send_message(
         cb.from_user.id,
-        "⭐ <b>Отзыв</b>\n"
+        "⭐ <b>Отзыв на сайт</b>\n"
         "Отправь оценку и текст в формате:\n"
         "<code>5 текст отзыва</code>  (от 1 до 5 звёзд)\n"
-        "<i>За отзыв — скидка 15% на следующий заказ.</i>",
+        "<i>За отзыв на сайте — скидка 15% на следующий заказ.</i>\n"
+        "<i>Это отдельно от оценки оператора.</i>",
         parse_mode="HTML",
     )
 
@@ -975,7 +1141,6 @@ async def cmd_last(msg: types.Message):
 async def msg_router(msg: types.Message):
     uid = msg.from_user.id
 
-    # --- назначение оператора ---
     if uid in WAITING_OP_ADD:
         WAITING_OP_ADD.discard(uid)
         if not is_super(uid):
@@ -993,18 +1158,13 @@ async def msg_router(msg: types.Message):
         if ok:
             await msg.answer(f"✅ Пользователь <code>{target}</code> назначен оператором.", parse_mode="HTML")
             try:
-                await bot.send_message(
-                    target,
-                    "🛠 Вам выдан доступ оператора NEBULA.\n"
-                    "Откройте /start — появится панель оператора.",
-                )
+                await bot.send_message(target, "🛠 Вам выдан доступ оператора NEBULA.\nОткройте /start — появится панель оператора.")
             except Exception:
                 pass
         else:
             await msg.answer(f"Пользователь <code>{target}</code> уже оператор.", parse_mode="HTML")
         return
 
-    # --- снятие оператора ---
     if uid in WAITING_OP_REMOVE:
         WAITING_OP_REMOVE.discard(uid)
         if not is_super(uid):
@@ -1029,7 +1189,6 @@ async def msg_router(msg: types.Message):
             await msg.answer(f"Пользователь <code>{target}</code> не найден в списке операторов.", parse_mode="HTML")
         return
 
-    # --- ждём номер заказа ---
     if uid in WAITING:
         WAITING.discard(uid)
         num = (msg.text or "").strip().upper()
@@ -1043,7 +1202,6 @@ async def msg_router(msg: types.Message):
                 back_kb())
         return
 
-    # --- отзыв ---
     for num, st in list(WAITING_REVIEW_TEXT.items()):
         if st.get("buyer") == uid:
             text = (msg.text or "").strip()
@@ -1062,7 +1220,7 @@ async def msg_router(msg: types.Message):
             review_add(num, uid, nick, city, stars, body[:200])
             WAITING_REVIEW_TEXT.pop(num, None)
             await msg.answer(
-                "✅ Отзыв сохранён.\n"
+                "✅ Отзыв на сайт сохранён.\n"
                 "<i>Скидка 15% на следующий заказ закреплена за вашим заказом.</i>",
                 parse_mode="HTML",
             )
@@ -1070,7 +1228,7 @@ async def msg_router(msg: types.Message):
                 try:
                     await bot.send_message(
                         op,
-                        f"⭐ <b>Новый отзыв</b> по {num}\n"
+                        f"⭐ <b>Новый отзыв на сайт</b> по {num}\n"
                         f"Оценка: {'★'*stars}{'☆'*(5-stars)}\n"
                         f"{body[:200]}",
                         parse_mode="HTML",
@@ -1079,7 +1237,6 @@ async def msg_router(msg: types.Message):
                     pass
             return
 
-    # --- вложения ---
     is_media = bool(msg.photo or msg.document or msg.video or msg.audio or msg.voice or msg.sticker)
     if is_media:
         t = ticket_by_buyer(uid)
@@ -1122,7 +1279,6 @@ async def msg_router(msg: types.Message):
         await msg.answer("📎 Сначала откройте обращение в разделе «Поддержка».")
         return
 
-    # --- оператор текстом ---
     if is_admin(uid):
         to = ticket_by_operator(uid)
         if to:
@@ -1144,7 +1300,6 @@ async def msg_router(msg: types.Message):
         await bot.send_message(msg.chat.id, "🛠 <b>Панель оператора</b>", reply_markup=admin_panel_kb(uid), parse_mode="HTML")
         return
 
-    # --- покупатель текстом ---
     t = ticket_by_buyer(uid)
     if t:
         if not t["operator_id"]:
